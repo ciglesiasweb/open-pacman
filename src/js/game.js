@@ -8,10 +8,15 @@ const DIRS = {
   up: { x: 0, y: -1 },
   down: { x: 0, y: 1 },
 };
-const OPPOSITE = { left: 'right', right: 'left', up: 'down', down: 'up' };
 
 const PACMAN_SPEED = 0.125; // 1/8 celda/frame -> alinea cada 8 frames
 const GHOST_SPEED = 0.1;    // 1/10 celda/frame
+const PATROL_POINTS = [
+  { x: 1, y: 1 },
+  { x: 26, y: 1 },
+  { x: 26, y: 29 },
+  { x: 1, y: 29 },
+];
 
 // Crea una partida nueva. Copia MAZE (pristino) a game.grid para poder comer
 // dots sin destruir el original, y reiniciar.
@@ -42,6 +47,9 @@ function createGame() {
       dir: 'up',
       speed: GHOST_SPEED,
       kind: g.kind,
+      releaseAt: g.releaseAt,
+      active: g.releaseAt === 0,
+      patrolIndex: 0,
     } ) ),
   };
 }
@@ -110,34 +118,142 @@ function movePacman( game ) {
   wrapTunnel( p, width );
 }
 
+function normalizeGhostCell( x, y, width ) {
+  if ( y === TUNNEL_ROW ) {
+    if ( x < 0 ) x += width;
+    else if ( x >= width ) x -= width;
+  }
+  return { x, y };
+}
+
+function ghostNeighbors( grid, x, y ) {
+  const width = grid[ 0 ].length;
+  return Object.keys( DIRS ).reduce( ( neighbors, dir ) => {
+    if ( !canMove( grid, x, y, dir, 'ghost' ) ) return neighbors;
+    const d = DIRS[ dir ];
+    const cell = normalizeGhostCell( x + d.x, y + d.y, width );
+    neighbors.push( { ...cell, dir } );
+    return neighbors;
+  }, [] );
+}
+
+function cellKey( x, y ) {
+  return x + ',' + y;
+}
+
+// Distancias de ruta más corta para todas las celdas alcanzables desde el inicio.
+function ghostDistances( game, startX, startY ) {
+  const start = normalizeGhostCell( startX, startY, game.grid[ 0 ].length );
+  const distances = new Map( [ [ cellKey( start.x, start.y ), 0 ] ] );
+  const queue = [ start ];
+  let head = 0;
+
+  while ( head < queue.length ) {
+    const cell = queue[ head++ ];
+    const distance = distances.get( cellKey( cell.x, cell.y ) );
+    for ( const neighbor of ghostNeighbors( game.grid, cell.x, cell.y ) ) {
+      const key = cellKey( neighbor.x, neighbor.y );
+      if ( distances.has( key ) ) continue;
+      distances.set( key, distance + 1 );
+      queue.push( { x: neighbor.x, y: neighbor.y } );
+    }
+  }
+  return distances;
+}
+
+function legalGhostDirections( game, g ) {
+  return Object.keys( DIRS ).filter(
+    ( dir ) => canMove( game.grid, g.x, g.y, dir, 'ghost' )
+  );
+}
+
+function chooseDirectionToward( game, g, targetX, targetY ) {
+  if ( g.x === targetX && g.y === targetY ) return;
+
+  const distances = ghostDistances( game, targetX, targetY );
+  const choices = legalGhostDirections( game, g );
+  if ( !choices.length ) return;
+
+  let best = choices.includes( g.dir ) ? g.dir : choices[ 0 ];
+  let bestDist = Infinity;
+  for ( const dir of choices ) {
+    const d = DIRS[ dir ];
+    const next = normalizeGhostCell( g.x + d.x, g.y + d.y, game.grid[ 0 ].length );
+    const dist = distances.get( cellKey( next.x, next.y ) );
+    if ( dist !== undefined && dist < bestDist ) {
+      bestDist = dist;
+      best = dir;
+    }
+  }
+  g.dir = best;
+}
+
+function nearestGhostCell( grid, x, y ) {
+  let nearest = null;
+  let bestDist = Infinity;
+  for ( let cy = 0; cy < grid.length; cy++ ) {
+    for ( let cx = 0; cx < grid[ 0 ].length; cx++ ) {
+      if ( isWall( grid, cx, cy, 'ghost' ) ) continue;
+      const dist = Math.abs( cx - x ) + Math.abs( cy - y );
+      if ( dist < bestDist ) {
+        bestDist = dist;
+        nearest = { x: cx, y: cy };
+      }
+    }
+  }
+  return nearest;
+}
+
+function ambusherTarget( game ) {
+  const p = game.pacman;
+  const d = DIRS[ p.dir ];
+  const target = normalizeGhostCell(
+    Math.round( p.x ) + d.x * 4,
+    Math.round( p.y ) + d.y * 4,
+    game.grid[ 0 ].length
+  );
+  if ( !isWall( game.grid, target.x, target.y, 'ghost' ) ) return target;
+  return nearestGhostCell( game.grid, target.x, target.y );
+}
+
 function decideGhost( game, g ) {
   const grid = game.grid;
   const p = game.pacman;
-
-  const options = Object.keys( DIRS ).filter(
-    ( dir ) => dir !== OPPOSITE[ g.dir ] && canMove( grid, g.x, g.y, dir, 'ghost' )
-  );
-  // Sin salida (callejon): permitir el giro de 180.
-  const choices = options.length ? options : [ '' + OPPOSITE[ g.dir ] ];
-
+  const px = Math.round( p.x );
+  const py = Math.round( p.y );
   if ( g.kind === 'hunter' ) {
-    const px = Math.round( p.x );
-    const py = Math.round( p.y );
-    let best = choices[ 0 ];
-    let bestDist = Infinity;
-    for ( const dir of choices ) {
-      const d = DIRS[ dir ];
-      const nx = g.x + d.x;
-      const ny = g.y + d.y;
-      const dist = Math.abs( nx - px ) + Math.abs( ny - py );
-      if ( dist < bestDist ) {
-        bestDist = dist;
-        best = dir;
-      }
+    chooseDirectionToward( game, g, px, py );
+  } else if ( g.kind === 'ambusher' ) {
+    const target = ambusherTarget( game );
+    chooseDirectionToward( game, g, target.x, target.y );
+  } else if ( g.kind === 'patrol' ) {
+    let target = PATROL_POINTS[ g.patrolIndex ];
+    if ( g.x === target.x && g.y === target.y ) {
+      g.patrolIndex = ( g.patrolIndex + 1 ) % PATROL_POINTS.length;
+      target = PATROL_POINTS[ g.patrolIndex ];
     }
-    g.dir = best;
-  } else {
-    g.dir = choices[ Math.floor( Math.random() * choices.length ) ];
+    chooseDirectionToward( game, g, target.x, target.y );
+  } else if ( g.kind === 'evasive' ) {
+    const distances = ghostDistances( game, px, py );
+    const currentDistance = distances.get( cellKey( g.x, g.y ) );
+    if ( currentDistance !== undefined && currentDistance <= 6 ) {
+      const choices = legalGhostDirections( game, g );
+      let best = choices.includes( g.dir ) ? g.dir : choices[ 0 ];
+      let bestDist = -Infinity;
+      for ( const dir of choices ) {
+        const d = DIRS[ dir ];
+        const next = normalizeGhostCell( g.x + d.x, g.y + d.y, grid[ 0 ].length );
+        const dist = distances.get( cellKey( next.x, next.y ) );
+        const score = dist === undefined ? Infinity : dist;
+        if ( score > bestDist ) {
+          bestDist = score;
+          best = dir;
+        }
+      }
+      if ( best ) g.dir = best;
+    } else {
+      chooseDirectionToward( game, g, px, py );
+    }
   }
 }
 
@@ -168,6 +284,7 @@ function resetPositions( game ) {
     g.x = GHOST_STARTS[ i ].x;
     g.y = GHOST_STARTS[ i ].y;
     g.dir = 'up';
+    g.patrolIndex = 0;
   } );
 }
 
@@ -175,12 +292,15 @@ function collides( a, b ) {
   return Math.abs( a.x - b.x ) < 0.5 && Math.abs( a.y - b.y ) < 0.5;
 }
 
-function update( game ) {
+function update( game, elapsedSeconds ) {
   movePacman( game );
-  game.ghosts.forEach( ( g ) => moveGhost( game, g ) );
+  game.ghosts.forEach( ( g ) => {
+    if ( !g.active && elapsedSeconds >= g.releaseAt ) g.active = true;
+    if ( g.active ) moveGhost( game, g );
+  } );
 
   for ( const g of game.ghosts ) {
-    if ( collides( game.pacman, g ) ) {
+    if ( g.active && collides( game.pacman, g ) ) {
       game.lives--;
       if ( game.lives <= 0 ) {
         game.state = 'lost';
